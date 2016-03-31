@@ -59,9 +59,9 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 
 	file_update_time(vma->vm_file);
 	lock_page(page);
-	if (unlikely(page->mapping != inode->i_mapping ||
+	if (page->mapping != inode->i_mapping ||
 			page_offset(page) > i_size_read(inode) ||
-			!PageUptodate(page))) {
+			!PageUptodate(page)) {
 		unlock_page(page);
 		err = -EFAULT;
 		goto out;
@@ -83,17 +83,9 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 	set_page_dirty(page);
 	SetPageUptodate(page);
 
-	trace_f2fs_vm_page_mkwrite(page, DATA);
 mapped:
 	/* fill the page */
-	f2fs_wait_on_page_writeback(page, DATA);
-
-	/* wait for GCed encrypted page writeback */
-	if (f2fs_encrypted_inode(inode) && S_ISREG(inode->i_mode))
-		f2fs_wait_on_encrypted_page_writeback(sbi, dn.data_blkaddr);
-
-	/* if gced page is attached, don't write to cold segment */
-	clear_cold_data(page);
+	wait_on_page_writeback(page);
 out:
 	sb_end_pagefault(inode->i_sb);
 	return block_page_mkwrite_return(err);
@@ -114,70 +106,12 @@ static int get_parent_ino(struct inode *inode, nid_t *pino)
 	if (!dentry)
 		return 0;
 
-	if (update_dent_inode(inode, inode, &dentry->d_name)) {
-		dput(dentry);
-		return 0;
-	}
-
-	*pino = parent_ino(dentry);
+	inode = igrab(dentry->d_parent->d_inode);
 	dput(dentry);
+
+	*pino = inode->i_ino;
+	iput(inode);
 	return 1;
-}
-
-static inline bool need_do_checkpoint(struct inode *inode)
-{
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	bool need_cp = false;
-
-	if (!S_ISREG(inode->i_mode) || inode->i_nlink != 1)
-		need_cp = true;
-	else if (file_enc_name(inode) && need_dentry_mark(sbi, inode->i_ino))
-		need_cp = true;
-	else if (file_wrong_pino(inode))
-		need_cp = true;
-	else if (!space_for_roll_forward(sbi))
-		need_cp = true;
-	else if (!is_checkpointed_node(sbi, F2FS_I(inode)->i_pino))
-		need_cp = true;
-	else if (F2FS_I(inode)->xattr_ver == cur_cp_version(F2FS_CKPT(sbi)))
-		need_cp = true;
-	else if (test_opt(sbi, FASTBOOT))
-		need_cp = true;
-	else if (sbi->active_logs == 2)
-		need_cp = true;
-
-	return need_cp;
-}
-
-static bool need_inode_page_update(struct f2fs_sb_info *sbi, nid_t ino)
-{
-	struct page *i = find_get_page(NODE_MAPPING(sbi), ino);
-	bool ret = false;
-	/* But we need to avoid that there are some inode updates */
-	if ((i && PageDirty(i)) || need_inode_block_update(sbi, ino))
-		ret = true;
-	f2fs_put_page(i, 0);
-	return ret;
-}
-
-static void try_to_fix_pino(struct inode *inode)
-{
-	struct f2fs_inode_info *fi = F2FS_I(inode);
-	nid_t pino;
-
-	down_write(&fi->i_sem);
-	fi->xattr_ver = 0;
-	if (file_wrong_pino(inode) && inode->i_nlink == 1 &&
-			get_parent_ino(inode, &pino)) {
-		fi->i_pino = pino;
-		file_got_pino(inode);
-		up_write(&fi->i_sem);
-
-		mark_inode_dirty_sync(inode);
-		f2fs_write_inode(inode, NULL);
-	} else {
-		up_write(&fi->i_sem);
-	}
 }
 
 int f2fs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
@@ -194,7 +128,7 @@ int f2fs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 		.for_reclaim = 0,
 	};
 
-	if (unlikely(f2fs_readonly(inode->i_sb)))
+	if (f2fs_readonly(inode->i_sb))
 		return 0;
 
 	trace_f2fs_sync_file_enter(inode);
@@ -235,38 +169,40 @@ go_write:
 	/* guarantee free sections for fsync */
 	f2fs_balance_fs(sbi);
 
-	/*
-	 * Both of fdatasync() and fsync() are able to be recovered from
-	 * sudden-power-off.
-	 */
-	down_read(&fi->i_sem);
-	need_cp = need_do_checkpoint(inode);
-	up_read(&fi->i_sem);
+	if (!S_ISREG(inode->i_mode) || inode->i_nlink != 1)
+		need_cp = true;
+	else if (file_wrong_pino(inode))
+		need_cp = true;
+	else if (!space_for_roll_forward(sbi))
+		need_cp = true;
+	else if (!is_checkpointed_node(sbi, F2FS_I(inode)->i_pino))
+		need_cp = true;
 
 	if (need_cp) {
+		nid_t pino;
+
 		/* all the dirty node pages should be flushed for POR */
 		ret = f2fs_sync_fs(inode->i_sb, 1);
-
-		/*
-		 * We've secured consistency through sync_fs. Following pino
-		 * will be used only for fsynced inodes after checkpoint.
-		 */
-		try_to_fix_pino(inode);
-		clear_inode_flag(fi, FI_APPEND_WRITE);
-		clear_inode_flag(fi, FI_UPDATE_WRITE);
-		goto out;
-	}
-sync_nodes:
-	sync_node_pages(sbi, ino, &wbc);
-
-	/* if cp_error was enabled, we should avoid infinite loop */
-	if (unlikely(f2fs_cp_error(sbi)))
-		goto out;
-
-	if (need_inode_block_update(sbi, ino)) {
-		mark_inode_dirty_sync(inode);
-		f2fs_write_inode(inode, NULL);
-		goto sync_nodes;
+		if (file_wrong_pino(inode) && inode->i_nlink == 1 &&
+					get_parent_ino(inode, &pino)) {
+			F2FS_I(inode)->i_pino = pino;
+			file_got_pino(inode);
+			mark_inode_dirty_sync(inode);
+			ret = f2fs_write_inode(inode, NULL);
+			if (ret)
+				goto out;
+		}
+	} else {
+		/* if there is no written node page, write its inode page */
+		while (!sync_node_pages(sbi, inode->i_ino, &wbc)) {
+			mark_inode_dirty_sync(inode);
+			ret = f2fs_write_inode(inode, NULL);
+			if (ret)
+				goto out;
+		}
+		filemap_fdatawait_range(sbi->node_inode->i_mapping,
+							0, LONG_MAX);
+		ret = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
 	}
 
 	ret = wait_on_node_pages_writeback(sbi, ino);
@@ -455,18 +391,6 @@ static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
-static int f2fs_file_open(struct inode *inode, struct file *filp)
-{
-	int ret = generic_file_open(inode, filp);
-
-	if (!ret && f2fs_encrypted_inode(inode)) {
-		ret = f2fs_get_encryption_info(inode);
-		if (ret)
-			ret = -EACCES;
-	}
-	return ret;
-}
-
 int truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
@@ -485,21 +409,10 @@ int truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 		dn->data_blkaddr = NULL_ADDR;
 		set_data_blkaddr(dn);
 		invalidate_blocks(sbi, blkaddr);
-		if (dn->ofs_in_node == 0 && IS_INODE(dn->node_page))
-			clear_inode_flag(F2FS_I(dn->inode),
-						FI_FIRST_BLOCK_WRITTEN);
 		nr_free++;
 	}
 
 	if (nr_free) {
-		pgoff_t fofs;
-		/*
-		 * once we invalidate valid blkaddr in range [ofs, ofs + count],
-		 * we will invalidate all blkaddr in the whole range.
-		 */
-		fofs = start_bidx_of_node(ofs_of_node(dn->node_page),
-						F2FS_I(dn->inode)) + ofs;
-		f2fs_update_extent_cache_range(dn, fofs, 0, len);
 		dec_valid_block_count(sbi, dn->inode, nr_free);
 		set_page_dirty(dn->node_page);
 		sync_inode_page(dn);
@@ -746,9 +659,9 @@ static int fill_zero(struct inode *inode, pgoff_t index,
 
 	f2fs_balance_fs(sbi);
 
-	f2fs_lock_op(sbi);
+	ilock = mutex_lock_op(sbi);
 	page = get_new_data_page(inode, NULL, index, false);
-	f2fs_unlock_op(sbi);
+	mutex_unlock_op(sbi, ilock);
 
 	if (IS_ERR(page))
 		return PTR_ERR(page);
@@ -1318,9 +1231,17 @@ static int f2fs_ioc_setflags(struct file *filp, unsigned long arg)
 	unsigned int oldflags;
 	int ret;
 
-	ret = mnt_want_write_file(filp);
-	if (ret)
-		return ret;
+	switch (cmd) {
+	case F2FS_IOC_GETFLAGS:
+		flags = fi->i_flags & FS_FL_USER_VISIBLE;
+		return put_user(flags, (int __user *) arg);
+	case F2FS_IOC_SETFLAGS:
+	{
+		unsigned int oldflags;
+
+		ret = mnt_want_write_file(filp);
+		if (ret)
+			return ret;
 
 	if (!inode_owner_or_capable(inode)) {
 		ret = -EACCES;

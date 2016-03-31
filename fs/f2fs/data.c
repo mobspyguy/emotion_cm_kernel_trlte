@@ -249,12 +249,25 @@ int reserve_new_block(struct dnode_of_data *dn)
 
 int f2fs_reserve_block(struct dnode_of_data *dn, pgoff_t index)
 {
-	bool need_put = dn->inode_page ? false : true;
-	int err;
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+#ifdef CONFIG_F2FS_STAT_FS
+	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
+#endif
+	pgoff_t start_fofs, end_fofs;
+	block_t start_blkaddr;
 
-	err = get_dnode_of_data(dn, index, ALLOC_NODE);
-	if (err)
-		return err;
+	read_lock(&fi->ext.ext_lock);
+	if (fi->ext.len == 0) {
+		read_unlock(&fi->ext.ext_lock);
+		return 0;
+	}
+
+#ifdef CONFIG_F2FS_STAT_FS
+	sbi->total_hit_ext++;
+#endif
+	start_fofs = fi->ext.fofs;
+	end_fofs = fi->ext.fofs + fi->ext.len - 1;
+	start_blkaddr = fi->ext.blk_addr;
 
 	if (dn->data_blkaddr == NULL_ADDR)
 		err = reserve_new_block(dn);
@@ -268,9 +281,11 @@ int f2fs_get_block(struct dnode_of_data *dn, pgoff_t index)
 	struct extent_info ei;
 	struct inode *inode = dn->inode;
 
-	if (f2fs_lookup_extent_cache(inode, index, &ei)) {
-		dn->data_blkaddr = ei.blk + index - ei.fofs;
-		return 0;
+#ifdef CONFIG_F2FS_STAT_FS
+		sbi->read_hit_ext++;
+#endif
+		read_unlock(&fi->ext.ext_lock);
+		return 1;
 	}
 
 	return f2fs_reserve_block(dn, index);
@@ -354,9 +369,22 @@ struct page *find_data_page(struct inode *inode, pgoff_t index)
 		return page;
 	f2fs_put_page(page, 0);
 
-	page = get_read_data_page(inode, index, READ_SYNC, false);
-	if (IS_ERR(page))
-		return page;
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	err = get_dnode_of_data(&dn, index, LOOKUP_NODE);
+	if (err)
+		return ERR_PTR(err);
+	f2fs_put_dnode(&dn);
+
+	if (dn.data_blkaddr == NULL_ADDR)
+		return ERR_PTR(-ENOENT);
+
+	/* By fallocate(), there is no cached page, but with NEW_ADDR */
+	if (dn.data_blkaddr == NEW_ADDR)
+		return ERR_PTR(-EINVAL);
+
+	page = grab_cache_page_write_begin(mapping, index, AOP_FLAG_NOFS);
+	if (!page)
+		return ERR_PTR(-ENOMEM);
 
 	if (PageUptodate(page))
 		return page;
@@ -379,9 +407,27 @@ struct page *get_lock_data_page(struct inode *inode, pgoff_t index,
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct page *page;
+	int err;
+
 repeat:
-	page = get_read_data_page(inode, index, READ_SYNC, for_write);
-	if (IS_ERR(page))
+	page = grab_cache_page_write_begin(mapping, index, AOP_FLAG_NOFS);
+	if (!page)
+		return ERR_PTR(-ENOMEM);
+
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	err = get_dnode_of_data(&dn, index, LOOKUP_NODE);
+	if (err) {
+		f2fs_put_page(page, 1);
+		return ERR_PTR(err);
+	}
+	f2fs_put_dnode(&dn);
+
+	if (dn.data_blkaddr == NULL_ADDR) {
+		f2fs_put_page(page, 1);
+		return ERR_PTR(-ENOENT);
+	}
+
+	if (PageUptodate(page))
 		return page;
 
 	/* wait for read completion */
@@ -401,13 +447,12 @@ repeat:
  * Caller ensures that this data page is never allocated.
  * A new zero-filled data page is allocated in the page cache.
  *
- * Also, caller should grab and release a rwsem by calling f2fs_lock_op() and
- * f2fs_unlock_op().
- * Note that, ipage is set only by make_empty_dir, and if any error occur,
- * ipage should be released by this function.
+ * Also, caller should grab and release a mutex by calling mutex_lock_op() and
+ * mutex_unlock_op().
+ * Note that, npage is set only by make_empty_dir.
  */
 struct page *get_new_data_page(struct inode *inode,
-		struct page *ipage, pgoff_t index, bool new_i_size)
+		struct page *npage, pgoff_t index, bool new_i_size)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct page *page;
@@ -424,14 +469,24 @@ repeat:
 		return ERR_PTR(-ENOMEM);
 	}
 
-	set_new_dnode(&dn, inode, ipage, NULL, 0);
-	err = f2fs_reserve_block(&dn, index);
-	if (err) {
-		f2fs_put_page(page, 1);
+	set_new_dnode(&dn, inode, npage, npage, 0);
+	err = get_dnode_of_data(&dn, index, ALLOC_NODE);
+	if (err)
 		return ERR_PTR(err);
+
+	if (dn.data_blkaddr == NULL_ADDR) {
+		if (reserve_new_block(&dn)) {
+			if (!npage)
+				f2fs_put_dnode(&dn);
+			return ERR_PTR(-ENOSPC);
+		}
 	}
-	if (!ipage)
+	if (!npage)
 		f2fs_put_dnode(&dn);
+repeat:
+	page = grab_cache_page(mapping, index);
+	if (!page)
+		return ERR_PTR(-ENOMEM);
 
 	if (PageUptodate(page))
 		goto got_it;
@@ -446,15 +501,12 @@ repeat:
 		if (IS_ERR(page))
 			goto repeat;
 
-		/* wait for read completion */
-		lock_page(page);
-	}
-got_it:
-	if (new_i_size && i_size_read(inode) <
-				((loff_t)(index + 1) << PAGE_CACHE_SHIFT)) {
-		i_size_write(inode, ((loff_t)(index + 1) << PAGE_CACHE_SHIFT));
+	if (new_i_size &&
+		i_size_read(inode) < ((index + 1) << PAGE_CACHE_SHIFT)) {
+		i_size_write(inode, ((index + 1) << PAGE_CACHE_SHIFT));
 		/* Only the directory inode sets new_i_size */
 		set_inode_flag(F2FS_I(inode), FI_UPDATE_DIR);
+		mark_inode_dirty_sync(inode);
 	}
 	return page;
 }
@@ -1083,12 +1135,11 @@ int do_write_data_page(struct f2fs_io_info *fio)
 	 * If current allocation needs SSR,
 	 * it had better in-place writes for updated data.
 	 */
-	if (unlikely(fio->blk_addr != NEW_ADDR &&
+	if (unlikely(old_blk_addr != NEW_ADDR &&
 			!is_cold_data(page) &&
 			need_inplace_update(inode))) {
-		rewrite_data_page(fio);
-		set_inode_flag(F2FS_I(inode), FI_UPDATE_WRITE);
-		trace_f2fs_do_write_data_page(page, IPU);
+		rewrite_data_page(F2FS_SB(inode->i_sb), page,
+						old_blk_addr);
 	} else {
 		write_data_page(&dn, fio);
 		set_data_blkaddr(&dn);
@@ -1531,8 +1582,7 @@ static int f2fs_write_end(struct file *file,
 {
 	struct inode *inode = page->mapping->host;
 
-	trace_f2fs_write_end(inode, pos, len, copied);
-
+	SetPageUptodate(page);
 	set_page_dirty(page);
 
 	if (pos + copied > i_size_read(inode)) {
@@ -1541,11 +1591,12 @@ static int f2fs_write_end(struct file *file,
 		update_inode_page(inode);
 	}
 
-	f2fs_put_page(page, 1);
+	unlock_page(page);
+	page_cache_release(page);
 	return copied;
 }
 
-static ssize_t check_direct_IO(struct inode *inode, int rw,
+static ssize_t f2fs_direct_IO(int rw, struct kiocb *iocb,
 		const struct iovec *iov, loff_t offset, unsigned long nr_segs)
 {
 	unsigned blocksize_mask = inode->i_sb->s_blocksize - 1;

@@ -183,7 +183,6 @@ static int f2fs_link(struct dentry *old_dentry, struct inode *dir,
 	err = f2fs_add_link(dentry, inode);
 	if (err)
 		goto out;
-	f2fs_unlock_op(sbi);
 
 	d_instantiate(dentry, inode);
 

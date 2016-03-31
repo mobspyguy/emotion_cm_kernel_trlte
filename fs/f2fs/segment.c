@@ -681,11 +681,17 @@ void release_discard_addrs(struct f2fs_sb_info *sbi)
 static void set_prefree_as_free_segments(struct f2fs_sb_info *sbi)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
-	unsigned int segno;
+	unsigned int segno = -1;
+	unsigned int total_segs = TOTAL_SEGS(sbi);
 
 	mutex_lock(&dirty_i->seglist_lock);
-	for_each_set_bit(segno, dirty_i->dirty_segmap[PRE], MAIN_SEGS(sbi))
+	while (1) {
+		segno = find_next_bit(dirty_i->dirty_segmap[PRE], total_segs,
+				segno + 1);
+		if (segno >= total_segs)
+			break;
 		__set_test_and_free(sbi, segno);
+	}
 	mutex_unlock(&dirty_i->seglist_lock);
 }
 
@@ -694,29 +700,30 @@ void clear_prefree_segments(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	struct list_head *head = &(SM_I(sbi)->discard_list);
 	struct discard_entry *entry, *this;
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
-	unsigned long *prefree_map = dirty_i->dirty_segmap[PRE];
-	unsigned int start = 0, end = -1;
+	unsigned int segno = -1;
+	unsigned int total_segs = TOTAL_SEGS(sbi);
 
 	mutex_lock(&dirty_i->seglist_lock);
 
 	while (1) {
-		int i;
-		start = find_next_bit(prefree_map, MAIN_SEGS(sbi), end + 1);
-		if (start >= MAIN_SEGS(sbi))
+		segno = find_next_bit(dirty_i->dirty_segmap[PRE], total_segs,
+				segno + 1);
+		if (segno >= total_segs)
 			break;
 		end = find_next_zero_bit(prefree_map, MAIN_SEGS(sbi),
 								start + 1);
 
-		for (i = start; i < end; i++)
-			clear_bit(i, prefree_map);
+		if (test_and_clear_bit(segno, dirty_i->dirty_segmap[PRE]))
+			dirty_i->nr_dirty[PRE]--;
 
-		dirty_i->nr_dirty[PRE] -= end - start;
-
-		if (!test_opt(sbi, DISCARD))
-			continue;
-
-		f2fs_issue_discard(sbi, START_BLOCK(sbi, start),
-				(end - start) << sbi->log_blocks_per_seg);
+		/* Let's use trim */
+		if (test_opt(sbi, DISCARD))
+			blkdev_issue_discard(sbi->sb->s_bdev,
+					START_BLOCK(sbi, segno) <<
+					sbi->log_sectors_per_block,
+					1 << (sbi->log_sectors_per_block +
+						sbi->log_blocks_per_seg),
+					GFP_NOFS, 0);
 	}
 	mutex_unlock(&dirty_i->seglist_lock);
 
@@ -914,19 +921,13 @@ void update_meta_page(struct f2fs_sb_info *sbi, void *src, block_t blk_addr)
 	f2fs_put_page(page, 1);
 }
 
-static void write_sum_page(struct f2fs_sb_info *sbi,
-			struct f2fs_summary_block *sum_blk, block_t blk_addr)
-{
-	update_meta_page(sbi, (void *)sum_blk, blk_addr);
-}
-
 static int is_next_segment_free(struct f2fs_sb_info *sbi, int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
 	unsigned int segno = curseg->segno + 1;
 	struct free_segmap_info *free_i = FREE_I(sbi);
 
-	if (segno < MAIN_SEGS(sbi) && segno % sbi->segs_per_sec)
+	if (segno < TOTAL_SEGS(sbi) && segno % sbi->segs_per_sec)
 		return !test_bit(segno, free_i->free_segmap);
 	return 0;
 }
@@ -1160,7 +1161,10 @@ static void allocate_segment_by_default(struct f2fs_sb_info *sbi,
 
 	if (force)
 		new_curseg(sbi, type, true);
-	else if (type == CURSEG_WARM_NODE)
+		goto out;
+	}
+
+	if (type == CURSEG_WARM_NODE)
 		new_curseg(sbi, type, false);
 	else if (curseg->alloc_type == LFS && is_next_segment_free(sbi, type))
 		new_curseg(sbi, type, false);
@@ -1168,6 +1172,18 @@ static void allocate_segment_by_default(struct f2fs_sb_info *sbi,
 		change_curseg(sbi, type, true);
 	else
 		new_curseg(sbi, type, false);
+out:
+#ifdef CONFIG_F2FS_STAT_FS
+	sbi->segment_count[curseg->alloc_type]++;
+#endif
+	return;
+}
+
+void allocate_new_segments(struct f2fs_sb_info *sbi)
+{
+	struct curseg_info *curseg;
+	unsigned int old_curseg;
+	int i;
 
 	stat_inc_seg_type(sbi, curseg);
 }
@@ -1335,6 +1351,9 @@ void allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	__add_sum_entry(sbi, type, sum);
 
 	__refresh_next_blkoff(sbi, curseg);
+#ifdef CONFIG_F2FS_STAT_FS
+	sbi->block_count[curseg->alloc_type]++;
+#endif
 
 	stat_inc_block_count(sbi, curseg);
 
@@ -1453,7 +1472,8 @@ static void __f2fs_replace_block(struct f2fs_sb_info *sbi,
 		change_curseg(sbi, type, true);
 	}
 
-	curseg->next_blkoff = GET_BLKOFF_FROM_SEG0(sbi, new_blkaddr);
+	curseg->next_blkoff = GET_SEGOFF_FROM_SEG0(sbi, new_blkaddr) &
+					(sbi->blocks_per_seg - 1);
 	__add_sum_entry(sbi, type, sum);
 
 	if (!recover_curseg)
@@ -1507,6 +1527,9 @@ static inline bool is_merged_page(struct f2fs_sb_info *sbi,
 		up_read(&io->io_rwsem);
 		return false;
 	}
+	curseg->next_blkoff = GET_SEGOFF_FROM_SEG0(sbi, new_blkaddr) &
+					(sbi->blocks_per_seg - 1);
+	__add_sum_entry(sbi, type, sum);
 
 	bio_for_each_segment_all(bvec, io->bio, i) {
 
@@ -2259,13 +2282,13 @@ static void init_dirty_segmap(struct f2fs_sb_info *sbi)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct free_segmap_info *free_i = FREE_I(sbi);
-	unsigned int segno = 0, offset = 0;
+	unsigned int segno = 0, offset = 0, total_segs = TOTAL_SEGS(sbi);
 	unsigned short valid_blocks;
 
 	while (1) {
 		/* find dirty segment based on free segmap */
-		segno = find_next_inuse(free_i, MAIN_SEGS(sbi), offset);
-		if (segno >= MAIN_SEGS(sbi))
+		segno = find_next_inuse(free_i, total_segs, offset);
+		if (segno >= total_segs)
 			break;
 		offset = segno + 1;
 		valid_blocks = get_valid_blocks(sbi, segno, 0);

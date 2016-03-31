@@ -75,7 +75,9 @@ static int gc_thread_func(void *data)
 		else
 			increase_sleep_time(gc_th, &wait_ms);
 
-		stat_inc_bggc_count(sbi);
+#ifdef CONFIG_F2FS_STAT_FS
+		sbi->bg_gc++;
+#endif
 
 		/* if return value is not zero, no victim was selected */
 		if (f2fs_gc(sbi, test_opt(sbi, FORCE_FG_GC)))
@@ -97,17 +99,13 @@ int start_gc_thread(struct f2fs_sb_info *sbi)
 	dev_t dev = sbi->sb->s_bdev->bd_dev;
 	int err = 0;
 
+	if (!test_opt(sbi, BG_GC))
+		goto out;
 	gc_th = kmalloc(sizeof(struct f2fs_gc_kthread), GFP_KERNEL);
 	if (!gc_th) {
 		err = -ENOMEM;
 		goto out;
 	}
-
-	gc_th->min_sleep_time = DEF_GC_THREAD_MIN_SLEEP_TIME;
-	gc_th->max_sleep_time = DEF_GC_THREAD_MAX_SLEEP_TIME;
-	gc_th->no_gc_sleep_time = DEF_GC_THREAD_NOGC_SLEEP_TIME;
-
-	gc_th->gc_idle = 0;
 
 	sbi->gc_thread = gc_th;
 	init_waitqueue_head(&sbi->gc_thread->gc_wait_queue_head);
@@ -118,6 +116,7 @@ int start_gc_thread(struct f2fs_sb_info *sbi)
 		kfree(gc_th);
 		sbi->gc_thread = NULL;
 	}
+
 out:
 	return err;
 }
@@ -260,7 +259,6 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct victim_sel_policy p;
 	unsigned int secno, max_cost;
-	unsigned int last_segment = MAIN_SEGS(sbi);
 	int nsearched = 0;
 
 	mutex_lock(&dirty_i->seglist_lock);
@@ -311,7 +309,9 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 		if (p.min_cost > cost) {
 			p.min_segno = segno;
 			p.min_cost = cost;
-		} else if (unlikely(cost == max_cost)) {
+		}
+
+		if (cost == max_cost)
 			continue;
 		}
 
@@ -349,9 +349,9 @@ static struct inode *find_gc_inode(struct gc_inode_list *gc_list, nid_t ino)
 {
 	struct inode_entry *ie;
 
-	ie = radix_tree_lookup(&gc_list->iroot, ino);
-	if (ie)
-		return ie->inode;
+	list_for_each_entry(ie, ilist, list)
+		if (ie->inode->i_ino == ino)
+			return ie->inode;
 	return NULL;
 }
 
@@ -359,9 +359,15 @@ static void add_gc_inode(struct gc_inode_list *gc_list, struct inode *inode)
 {
 	struct inode_entry *new_ie;
 
-	if (inode == find_gc_inode(gc_list, inode->i_ino)) {
+	if (inode == find_gc_inode(inode->i_ino, ilist)) {
 		iput(inode);
 		return;
+	}
+repeat:
+	new_ie = kmem_cache_alloc(winode_slab, GFP_NOFS);
+	if (!new_ie) {
+		cond_resched();
+		goto repeat;
 	}
 	new_ie = f2fs_kmem_cache_alloc(inode_entry_slab, GFP_NOFS);
 	new_ie->inode = inode;

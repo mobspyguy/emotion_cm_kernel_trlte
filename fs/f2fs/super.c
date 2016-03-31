@@ -270,7 +270,6 @@ static void init_once(void *foo)
 static int parse_options(struct super_block *sb, char *options)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
-	struct request_queue *q;
 	substring_t args[MAX_OPT_ARGS];
 	char *p, *name;
 	int arg = 0;
@@ -295,16 +294,11 @@ static int parse_options(struct super_block *sb, char *options)
 
 			if (!name)
 				return -ENOMEM;
-			if (strlen(name) == 2 && !strncmp(name, "on", 2)) {
+			if (!strncmp(name, "on", 2))
 				set_opt(sbi, BG_GC);
-				clear_opt(sbi, FORCE_FG_GC);
-			} else if (strlen(name) == 3 && !strncmp(name, "off", 3)) {
+			else if (!strncmp(name, "off", 3))
 				clear_opt(sbi, BG_GC);
-				clear_opt(sbi, FORCE_FG_GC);
-			} else if (strlen(name) == 4 && !strncmp(name, "sync", 4)) {
-				set_opt(sbi, BG_GC);
-				set_opt(sbi, FORCE_FG_GC);
-			} else {
+			else {
 				kfree(name);
 				return -EINVAL;
 			}
@@ -313,60 +307,27 @@ static int parse_options(struct super_block *sb, char *options)
 		case Opt_disable_roll_forward:
 			set_opt(sbi, DISABLE_ROLL_FORWARD);
 			break;
-		case Opt_norecovery:
-			/* this option mounts f2fs with ro */
-			set_opt(sbi, DISABLE_ROLL_FORWARD);
-			if (!f2fs_readonly(sb))
-				return -EINVAL;
-			break;
 		case Opt_discard:
-			q = bdev_get_queue(sb->s_bdev);
-			if (blk_queue_discard(q)) {
-				set_opt(sbi, DISCARD);
-			} else {
-				f2fs_msg(sb, KERN_WARNING,
-					"mounting with \"discard\" option, but "
-					"the device does not support discard");
-			}
+			set_opt(sbi, DISCARD);
 			break;
 		case Opt_noheap:
 			set_opt(sbi, NOHEAP);
 			break;
 #ifdef CONFIG_F2FS_FS_XATTR
-		case Opt_user_xattr:
-			set_opt(sbi, XATTR_USER);
-			break;
 		case Opt_nouser_xattr:
 			clear_opt(sbi, XATTR_USER);
 			break;
-		case Opt_inline_xattr:
-			set_opt(sbi, INLINE_XATTR);
-			break;
 #else
-		case Opt_user_xattr:
-			f2fs_msg(sb, KERN_INFO,
-				"user_xattr options not supported");
-			break;
 		case Opt_nouser_xattr:
 			f2fs_msg(sb, KERN_INFO,
 				"nouser_xattr options not supported");
 			break;
-		case Opt_inline_xattr:
-			f2fs_msg(sb, KERN_INFO,
-				"inline_xattr options not supported");
-			break;
 #endif
 #ifdef CONFIG_F2FS_FS_POSIX_ACL
-		case Opt_acl:
-			set_opt(sbi, POSIX_ACL);
-			break;
 		case Opt_noacl:
 			clear_opt(sbi, POSIX_ACL);
 			break;
 #else
-		case Opt_acl:
-			f2fs_msg(sb, KERN_INFO, "acl options not supported");
-			break;
 		case Opt_noacl:
 			f2fs_msg(sb, KERN_INFO, "noacl options not supported");
 			break;
@@ -380,30 +341,6 @@ static int parse_options(struct super_block *sb, char *options)
 			break;
 		case Opt_disable_ext_identify:
 			set_opt(sbi, DISABLE_EXT_IDENTIFY);
-			break;
-		case Opt_inline_data:
-			set_opt(sbi, INLINE_DATA);
-			break;
-		case Opt_inline_dentry:
-			set_opt(sbi, INLINE_DENTRY);
-			break;
-		case Opt_flush_merge:
-			set_opt(sbi, FLUSH_MERGE);
-			break;
-		case Opt_nobarrier:
-			set_opt(sbi, NOBARRIER);
-			break;
-		case Opt_fastboot:
-			set_opt(sbi, FASTBOOT);
-			break;
-		case Opt_extent_cache:
-			set_opt(sbi, EXTENT_CACHE);
-			break;
-		case Opt_noextent_cache:
-			clear_opt(sbi, EXTENT_CACHE);
-			break;
-		case Opt_noinline_data:
-			clear_opt(sbi, INLINE_DATA);
 			break;
 		default:
 			f2fs_msg(sb, KERN_ERR,
@@ -499,6 +436,7 @@ static int f2fs_drop_inode(struct inode *inode)
 static void f2fs_dirty_inode(struct inode *inode, int flags)
 {
 	set_inode_flag(F2FS_I(inode), FI_DIRTY_INODE);
+	return;
 }
 
 static void f2fs_i_callback(struct rcu_head *head)
@@ -639,14 +577,10 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(root->d_sb);
 
-	if (!f2fs_readonly(sbi->sb) && test_opt(sbi, BG_GC)) {
-		if (test_opt(sbi, FORCE_FG_GC))
-			seq_printf(seq, ",background_gc=%s", "sync");
-		else
-			seq_printf(seq, ",background_gc=%s", "on");
-	} else {
+	if (!(root->d_sb->s_flags & MS_RDONLY) && test_opt(sbi, BG_GC))
+		seq_printf(seq, ",background_gc=%s", "on");
+	else
 		seq_printf(seq, ",background_gc=%s", "off");
-	}
 	if (test_opt(sbi, DISABLE_ROLL_FORWARD))
 		seq_puts(seq, ",disable_roll_forward");
 	if (test_opt(sbi, DISCARD))
@@ -690,73 +624,11 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	return 0;
 }
 
-static int segment_info_seq_show(struct seq_file *seq, void *offset)
-{
-	struct super_block *sb = seq->private;
-	struct f2fs_sb_info *sbi = F2FS_SB(sb);
-	unsigned int total_segs =
-			le32_to_cpu(sbi->raw_super->segment_count_main);
-	int i;
-
-	seq_puts(seq, "format: segment_type|valid_blocks\n"
-		"segment_type(0:HD, 1:WD, 2:CD, 3:HN, 4:WN, 5:CN)\n");
-
-	for (i = 0; i < total_segs; i++) {
-		struct seg_entry *se = get_seg_entry(sbi, i);
-
-		if ((i % 10) == 0)
-			seq_printf(seq, "%-10d", i);
-		seq_printf(seq, "%d|%-3u", se->type,
-					get_valid_blocks(sbi, i, 1));
-		if ((i % 10) == 9 || i == (total_segs - 1))
-			seq_putc(seq, '\n');
-		else
-			seq_putc(seq, ' ');
-	}
-
-	return 0;
-}
-
-static int segment_info_open_fs(struct inode *inode, struct file *file)
-{
-	return single_open(file, segment_info_seq_show, PDE_DATA(inode));
-}
-
-static const struct file_operations f2fs_seq_segment_info_fops = {
-	.owner = THIS_MODULE,
-	.open = segment_info_open_fs,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static void default_options(struct f2fs_sb_info *sbi)
-{
-	/* init some FS parameters */
-	sbi->active_logs = NR_CURSEG_TYPE;
-
-	set_opt(sbi, BG_GC);
-	set_opt(sbi, INLINE_DATA);
-	set_opt(sbi, EXTENT_CACHE);
-
-#ifdef CONFIG_F2FS_FS_XATTR
-	set_opt(sbi, XATTR_USER);
-#endif
-#ifdef CONFIG_F2FS_FS_POSIX_ACL
-	set_opt(sbi, POSIX_ACL);
-#endif
-}
-
 static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 	struct f2fs_mount_info org_mount_opt;
 	int err, active_logs;
-	bool need_restart_gc = false;
-	bool need_stop_gc = false;
-	bool no_extent_cache = !test_opt(sbi, EXTENT_CACHE);
-
-	sync_filesystem(sb);
 
 	/*
 	 * Save the old mount options in case we
@@ -765,9 +637,6 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 	org_mount_opt = sbi->mount_opt;
 	active_logs = sbi->active_logs;
 
-	sbi->mount_opt.opt = 0;
-	default_options(sbi);
-
 	/* parse mount options */
 	err = parse_options(sb, data);
 	if (err)
@@ -775,18 +644,10 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 
 	/*
 	 * Previous and new state of filesystem is RO,
-	 * so skip checking GC and FLUSH_MERGE conditions.
+	 * so no point in checking GC conditions.
 	 */
-	if (f2fs_readonly(sb) && (*flags & MS_RDONLY))
+	if ((sb->s_flags & MS_RDONLY) && (*flags & MS_RDONLY))
 		goto skip;
-
-	/* disallow enable/disable extent_cache dynamically */
-	if (no_extent_cache == !!test_opt(sbi, EXTENT_CACHE)) {
-		err = -EINVAL;
-		f2fs_msg(sbi->sb, KERN_WARNING,
-				"switch extent_cache option is not allowed");
-		goto restore_opts;
-	}
 
 	/*
 	 * We stop the GC thread if FS is mounted as RO
@@ -797,39 +658,18 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 		if (sbi->gc_thread) {
 			stop_gc_thread(sbi);
 			f2fs_sync_fs(sb, 1);
-			need_restart_gc = true;
 		}
-	} else if (!sbi->gc_thread) {
+	} else if (test_opt(sbi, BG_GC) && !sbi->gc_thread) {
 		err = start_gc_thread(sbi);
 		if (err)
 			goto restore_opts;
-		need_stop_gc = true;
-	}
-
-	/*
-	 * We stop issue flush thread if FS is mounted as RO
-	 * or if flush_merge is not passed in mount option.
-	 */
-	if ((*flags & MS_RDONLY) || !test_opt(sbi, FLUSH_MERGE)) {
-		destroy_flush_cmd_control(sbi);
-	} else if (!SM_I(sbi)->cmd_control_info) {
-		err = create_flush_cmd_control(sbi);
-		if (err)
-			goto restore_gc;
 	}
 skip:
 	/* Update the POSIXACL Flag */
 	 sb->s_flags = (sb->s_flags & ~MS_POSIXACL) |
 		(test_opt(sbi, POSIX_ACL) ? MS_POSIXACL : 0);
 	return 0;
-restore_gc:
-	if (need_restart_gc) {
-		if (start_gc_thread(sbi))
-			f2fs_msg(sbi->sb, KERN_WARNING,
-				"background gc thread has stopped");
-	} else if (need_stop_gc) {
-		stop_gc_thread(sbi);
-	}
+
 restore_opts:
 	sbi->mount_opt = org_mount_opt;
 	sbi->active_logs = active_logs;
@@ -1149,16 +989,25 @@ try_onemore:
 		goto free_sbi;
 	}
 
-	err = read_raw_super_block(sb, &raw_super, &raw_super_buf, &recovery);
-	if (err)
-		goto free_sbi;
+	err = validate_superblock(sb, &raw_super, &raw_super_buf, 0);
+	if (err) {
+		brelse(raw_super_buf);
+		/* check secondary superblock when primary failed */
+		err = validate_superblock(sb, &raw_super, &raw_super_buf, 1);
+		if (err)
+			goto free_sb_buf;
+	}
+	sb->s_fs_info = sbi;
+	/* init some FS parameters */
+	sbi->active_logs = NR_CURSEG_TYPE;
+
+	set_opt(sbi, BG_GC);
 
 	sb->s_fs_info = sbi;
 	default_options(sbi);
 	/* parse mount options */
-	options = kstrdup((const char *)data, GFP_KERNEL);
-	if (data && !options) {
-		err = -ENOMEM;
+	err = parse_options(sb, (char *)data);
+	if (err)
 		goto free_sb_buf;
 	}
 
@@ -1340,13 +1189,16 @@ try_onemore:
 	 * If filesystem is not mounted as read-only then
 	 * do start the gc_thread.
 	 */
-	if (test_opt(sbi, BG_GC) && !f2fs_readonly(sb)) {
+	if (!(sb->s_flags & MS_RDONLY)) {
 		/* After POR, we can run background GC thread.*/
 		err = start_gc_thread(sbi);
 		if (err)
-			goto free_kobj;
+			goto fail;
 	}
-	kfree(options);
+
+	err = f2fs_build_stats(sbi);
+	if (err)
+		goto fail;
 
 	/* recover broken superblock */
 	if (recovery && !f2fs_readonly(sb) && !bdev_read_only(sb->s_bdev)) {

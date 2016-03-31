@@ -506,14 +506,6 @@ int get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 		if (IS_ERR(npage[0]))
 			return PTR_ERR(npage[0]);
 	}
-
-	/* if inline_data is set, should not report any block indices */
-	if (f2fs_has_inline_data(dn->inode) && index) {
-		err = -ENOENT;
-		f2fs_put_page(npage[0], 1);
-		goto release_out;
-	}
-
 	parent = npage[0];
 	if (level != 0)
 		nids[1] = get_nid(parent, offset[0], true);
@@ -932,7 +924,7 @@ int remove_inode_page(struct inode *inode)
 	return 0;
 }
 
-struct page *new_inode_page(struct inode *inode)
+struct page *new_inode_page(struct inode *inode, const struct qstr *name)
 {
 	struct dnode_of_data dn;
 
@@ -985,6 +977,7 @@ struct page *new_node_page(struct dnode_of_data *dn,
 		update_inode(dn->inode, ipage);
 	else
 		sync_inode_page(dn);
+	set_page_dirty(page);
 	if (ofs == 0)
 		inc_valid_inode_count(sbi);
 
@@ -1783,11 +1776,10 @@ int recover_inode_page(struct f2fs_sb_info *sbi, struct page *page)
 	new_ni = old_ni;
 	new_ni.ino = ino;
 
-	if (unlikely(!inc_valid_node_count(sbi, NULL)))
+	if (!inc_valid_node_count(sbi, NULL, 1))
 		WARN_ON(1);
-	set_node_addr(sbi, &new_ni, NEW_ADDR, false);
+	set_node_addr(sbi, &new_ni, NEW_ADDR);
 	inc_valid_inode_count(sbi);
-	set_page_dirty(ipage);
 	f2fs_put_page(ipage, 1);
 	return 0;
 }

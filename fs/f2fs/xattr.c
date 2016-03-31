@@ -55,8 +55,8 @@ static size_t f2fs_xattr_generic_list(struct dentry *dentry, char *list,
 	total_len = prefix_len + len + 1;
 	if (list && total_len <= list_size) {
 		memcpy(list, prefix, prefix_len);
-		memcpy(list + prefix_len, name, len);
-		list[prefix_len + len] = '\0';
+		memcpy(list + prefix_len, name, name_len);
+		list[prefix_len + name_len] = '\0';
 	}
 	return total_len;
 }
@@ -82,7 +82,7 @@ static int f2fs_xattr_generic_get(struct dentry *dentry, const char *name,
 	}
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
-	return f2fs_getxattr(dentry->d_inode, type, name, buffer, size, NULL);
+	return f2fs_getxattr(dentry->d_inode, type, name, buffer, size);
 }
 
 static int f2fs_xattr_generic_set(struct dentry *dentry, const char *name,
@@ -107,8 +107,7 @@ static int f2fs_xattr_generic_set(struct dentry *dentry, const char *name,
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
 
-	return f2fs_setxattr(dentry->d_inode, type, name,
-					value, size, NULL, flags);
+	return f2fs_setxattr(dentry->d_inode, type, name, value, size, NULL);
 }
 
 static size_t f2fs_xattr_advise_list(struct dentry *dentry, char *list,
@@ -166,7 +165,7 @@ static int f2fs_initxattrs(struct inode *inode, const struct xattr *xattr_array,
 	for (xattr = xattr_array; xattr->name != NULL; xattr++) {
 		err = f2fs_setxattr(inode, F2FS_XATTR_INDEX_SECURITY,
 				xattr->name, xattr->value,
-				xattr->value_len, (struct page *)page, 0);
+				xattr->value_len, (struct page *)page);
 		if (err < 0)
 			break;
 	}
@@ -253,6 +252,22 @@ static struct f2fs_xattr_entry *__find_xattr(void *base_addr, int index,
 					size_t len, const char *name)
 {
 	struct f2fs_xattr_entry *entry;
+	struct page *page;
+	void *base_addr;
+	int error = 0, found = 0;
+	size_t value_len, name_len;
+
+	if (name == NULL)
+		return -EINVAL;
+	name_len = strlen(name);
+
+	if (!fi->i_xattr_nid)
+		return -ENODATA;
+
+	page = get_node_page(sbi, fi->i_xattr_nid);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+	base_addr = page_address(page);
 
 	list_for_each_xattr(entry, base_addr) {
 		if (entry->e_name_index != index)
@@ -449,9 +464,13 @@ ssize_t f2fs_listxattr(struct dentry *dentry, char *buffer, size_t buffer_size)
 	int error = 0;
 	size_t rest = buffer_size;
 
-	base_addr = read_all_xattrs(inode, NULL);
-	if (!base_addr)
-		return -ENOMEM;
+	if (!fi->i_xattr_nid)
+		return 0;
+
+	page = get_node_page(sbi, fi->i_xattr_nid);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+	base_addr = page_address(page);
 
 	list_for_each_xattr(entry, base_addr) {
 		const struct xattr_handler *handler =
@@ -478,9 +497,8 @@ cleanup:
 	return error;
 }
 
-static int __f2fs_setxattr(struct inode *inode, int index,
-			const char *name, const void *value, size_t size,
-			struct page *ipage, int flags)
+int f2fs_setxattr(struct inode *inode, int name_index, const char *name,
+			const void *value, size_t value_len, struct page *ipage)
 {
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_xattr_entry *here, *last;
@@ -504,9 +522,20 @@ static int __f2fs_setxattr(struct inode *inode, int index,
 	if (size > MAX_VALUE_LEN(inode))
 		return -E2BIG;
 
-	base_addr = read_all_xattrs(inode, ipage);
-	if (!base_addr)
-		goto exit;
+		if (!alloc_nid(sbi, &fi->i_xattr_nid)) {
+			error = -ENOSPC;
+			goto exit;
+		}
+		set_new_dnode(&dn, inode, NULL, NULL, fi->i_xattr_nid);
+		mark_inode_dirty(inode);
+
+		page = new_node_page(&dn, XATTR_NODE_OFFSET, ipage);
+		if (IS_ERR(page)) {
+			alloc_nid_failed(sbi, fi->i_xattr_nid);
+			fi->i_xattr_nid = 0;
+			error = PTR_ERR(page);
+			goto exit;
+		}
 
 	/* find entry with wanted name. */
 	here = __find_xattr(base_addr, index, len, name);
@@ -586,14 +615,15 @@ static int __f2fs_setxattr(struct inode *inode, int index,
 		inode->i_ctime = CURRENT_TIME;
 		clear_inode_flag(fi, FI_ACL_MODE);
 	}
-	if (index == F2FS_XATTR_INDEX_ENCRYPTION &&
-			!strcmp(name, F2FS_XATTR_NAME_ENCRYPTION_CONTEXT))
-		f2fs_set_encrypted_inode(inode);
-
 	if (ipage)
 		update_inode(inode, ipage);
 	else
 		update_inode_page(inode);
+	mutex_unlock_op(sbi, ilock);
+
+	return 0;
+cleanup:
+	f2fs_put_page(page, 1);
 exit:
 	kzfree(base_addr);
 	return error;

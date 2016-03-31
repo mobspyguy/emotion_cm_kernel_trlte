@@ -1039,6 +1039,14 @@ static void wcd9xxx_clsh_state_hph_lo(struct snd_soc_codec *codec,
 		if ((req_state == WCD9XXX_CLSH_STATE_LO) ||
 		((clsh_d->state & (~req_state)) == WCD9XXX_CLSH_STATE_LO)) {
 			wcd9xxx_ncp_bypass_enable(codec, false);
+ 
+			if ((clsh_d->state & (~req_state)) ==
+						WCD9XXX_CLSH_STATE_LO) {
+				wcd9xxx_set_fclk_get_ncp(codec, clsh_d,
+							NCP_FCLK_LEVEL_5);
+				wcd9xxx_set_fclk_put_ncp(codec, clsh_d,
+							NCP_FCLK_LEVEL_8);
+			}
 
 			if ((clsh_d->state & (~req_state)) ==
 						WCD9XXX_CLSH_STATE_LO) {
