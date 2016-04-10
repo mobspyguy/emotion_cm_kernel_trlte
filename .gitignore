@@ -204,6 +204,7 @@ arch/arm/configs/apq8084_emotion_defconfig
 arch/arm/configs/apq8084_nate_defconfig
 #arch/arm/configs/apq8084_sec_userdebug_defconfig
 bbuild.sh
+bbuild_tw.sh
 !boot.img-ramdisk.gz
 ramdisk.img
 compile.log
