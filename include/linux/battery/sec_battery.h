@@ -185,7 +185,9 @@ struct sec_battery_info {
 	int eng_not_full_status;
 #if defined(CONFIG_BATTERY_SWELLING)
 	bool swelling_mode;
-	bool charging_block;
+	bool swelling_block;
+	unsigned long swelling_block_start;
+	unsigned long swelling_block_passed;
 	int swelling_full_check_cnt;
 #endif
 };
