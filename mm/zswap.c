@@ -77,9 +77,9 @@ static u64 zswap_duplicate_entry;
 /*********************************
 * tunables
 **********************************/
-/* Enable/disable zswap (disabled by default) */
-static bool zswap_enabled = 0;
-module_param_named(enabled, zswap_enabled, bool, 0644);
+/* Enable/disable zswap (enabled by default, fixed at boot for now) */
+static bool zswap_enabled = 1;
+module_param_named(enabled, zswap_enabled, bool, 0);
 
 /* Compressor to be used by zswap (fixed at boot for now) */
 #define ZSWAP_COMPRESSOR_DEFAULT "lzo"
@@ -410,7 +410,7 @@ static inline void zswap_page_pool_destroy(void)
 	mempool_destroy(zswap_page_pool);
 }
 
-/*static struct page *zswap_alloc_page(gfp_t flags)
+static struct page *zswap_alloc_page(gfp_t flags)
 {
 	struct page *page;
 
@@ -435,7 +435,7 @@ static void zswap_free_page(struct page *page)
 static struct zs_ops zswap_zs_ops = {
 	.alloc = zswap_alloc_page,
 	.free = zswap_free_page
-};*/
+};
 
 
 /*********************************
@@ -783,9 +783,6 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 #ifdef CONFIG_ZSWAP_ENABLE_WRITEBACK
 	u8 *tmpdst;
 #endif
-	
-	if (!zswap_enabled)
-		return -EPERM;
 
 	if (!tree) {
 		ret = -ENODEV;
@@ -816,7 +813,9 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	}
 
 	/* store */
-	handle = zs_malloc(tree->pool, dlen);
+	handle = zs_malloc(tree->pool, dlen,
+		__GFP_NORETRY | __GFP_HIGHMEM | __GFP_NOMEMALLOC |
+			__GFP_NOWARN);
 	if (!handle) {
 #ifdef CONFIG_ZSWAP_ENABLE_WRITEBACK
 		zswap_writeback_attempted++;
@@ -840,7 +839,9 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 		/* TODO: replace with more targeted policy */
 		zswap_writeback_entries(tree, 16);
 		/* try again, allowing wait */
-		handle = zs_malloc(tree->pool, dlen);
+		handle = zs_malloc(tree->pool, dlen,
+			__GFP_NORETRY | __GFP_HIGHMEM | __GFP_NOMEMALLOC |
+				__GFP_NOWARN);
 		if (!handle) {
 			/* still no space, fail */
 			zswap_reject_zsmalloc_fail++;
@@ -1045,7 +1046,7 @@ static void zswap_frontswap_init(unsigned type)
 	tree = kzalloc(sizeof(struct zswap_tree), GFP_ATOMIC);
 	if (!tree)
 		goto err;
-	tree->pool = zs_create_pool(GFP_NOWAIT | __GFP_HIGHMEM);
+	tree->pool = zs_create_pool(GFP_NOWAIT, &zswap_zs_ops);
 	if (!tree->pool)
 		goto freetree;
 	tree->rbroot = RB_ROOT;

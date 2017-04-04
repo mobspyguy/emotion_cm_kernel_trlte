@@ -261,7 +261,6 @@ EXPORT_SYMBOL(kgsl_mem_entry_destroy);
  *
  * @returns - 0 on success else error code
  *
- * This function should be called with processes memory spinlock held
  */
 static int
 kgsl_mem_entry_track_gpuaddr(struct kgsl_process_private *process,
@@ -288,13 +287,12 @@ kgsl_mem_entry_track_gpuaddr(struct kgsl_process_private *process,
 		goto done;
 	}
 	ret = kgsl_mmu_get_gpuaddr(pagetable, &entry->memdesc);
-
 done:
 	return ret;
 }
 
 static void kgsl_mem_entry_commit_mem_list(struct kgsl_process_private *process,
-						struct kgsl_mem_entry *entry)
+				struct kgsl_mem_entry *entry)
 {
 	struct rb_node **node;
 	struct rb_node *parent = NULL;
@@ -304,6 +302,7 @@ static void kgsl_mem_entry_commit_mem_list(struct kgsl_process_private *process,
 
 	/* Insert mem entry in mem_rb tree */
 	node = &process->mem_rb.rb_node;
+
 	while (*node) {
 		struct kgsl_mem_entry *cur;
 
@@ -4487,9 +4486,8 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 	disable_irq(device->pwrctrl.interrupt_num);
 
 	KGSL_DRV_INFO(device,
-		"dev_id %d regs phys 0x%08lx size 0x%08x virt %p\n",
-		device->id, device->reg_phys, device->reg_len,
-		device->reg_virt);
+		"dev_id %d regs phys 0x%08lx size 0x%08x\n",
+		device->id, device->reg_phys, device->reg_len);
 
 	rwlock_init(&device->context_lock);
 

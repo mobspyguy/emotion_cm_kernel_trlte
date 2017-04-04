@@ -548,7 +548,7 @@ void mdss_dump_reg(char __iomem *base, int len)
 #if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
 		pr_err("%04x : %08x %08x %08x %08x\n", i * 16, x0, x4, x8, xc);
 #else
-		pr_info("%p : %08x %08x %08x %08x\n", addr, x0, x4, x8, xc);
+		pr_info("%pK : %08x %08x %08x %08x\n", addr, x0, x4, x8, xc);
 #endif
 		addr += 16;
 	}
@@ -619,7 +619,7 @@ static inline struct mdss_mdp_misr_map *mdss_misr_get_map(u32 block_id)
 {
 	struct mdss_mdp_misr_map *map;
 
-	if (block_id > DISPLAY_MISR_MDP) {
+	if (block_id > DISPLAY_MISR_HDMI && block_id != DISPLAY_MISR_MDP) {
 		pr_err("MISR Block id (%d) out of range\n", block_id);
 		return NULL;
 	}
@@ -670,6 +670,11 @@ int mdss_misr_set(struct mdss_data_type *mdata,
 	bool is_valid_wb_mixer = true;
 	bool use_mdp_up_misr = false;
 
+	if (!mdata || !req || !ctl) {
+		pr_err("Invalid input params: mdata = %pK req = %pK ctl = %pK",
+			mdata, req, ctl);
+		return -EINVAL;
+	}
 	map = mdss_misr_get_map(req->block_id);
 	use_mdp_up_misr = switch_mdp_misr_offset(map, mdata->mdp_rev,
 				req->block_id);
