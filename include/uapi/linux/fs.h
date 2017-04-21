@@ -168,7 +168,7 @@ struct inodes_stat_t {
 
 /*
  * File system encryption support
-+*/
+ */
 /* Policy provided via an ioctl on the topmost directory */
 #define FS_KEY_DESCRIPTOR_SIZE	8
 
