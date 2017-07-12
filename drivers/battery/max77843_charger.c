@@ -36,6 +36,7 @@ static enum power_supply_property max77843_charger_props[] = {
 	POWER_SUPPLY_PROP_USB_HC,
 #if defined(CONFIG_BATTERY_SWELLING)
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 #endif
 };
 static enum power_supply_property max77843_otg_props[] = {
@@ -1119,6 +1120,8 @@ static int max77843_chg_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		val->intval = max77843_get_input_current(charger);
+		// AOSP expects microamperes
+		val->intval *= 1000;
 		pr_debug("%s : set-current(%dmA), current now(%dmA)\n",
 			__func__, charger->charging_current, val->intval);
 		break;
@@ -1127,6 +1130,12 @@ static int max77843_chg_get_property(struct power_supply *psy,
 #if defined(CONFIG_BATTERY_SWELLING)
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		val->intval = max77843_get_float_voltage(charger);
+		val->intval *= 100000;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		/* voltage value should be in uV */
+		val->intval = max77843_get_float_voltage(charger);
+		val->intval *= 100000;
 		break;
 #endif
 	case POWER_SUPPLY_PROP_USB_HC:
