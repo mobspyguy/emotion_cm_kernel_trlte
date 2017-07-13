@@ -38,9 +38,6 @@
 
 #include "internal.h"
 #include "mount.h"
-#ifdef CONFIG_SDCARD_FS
-#include "sdcardfs/sdcardfs.h"
-#endif
 
 /* [Feb-1997 T. Schoebel-Theuer]
  * Fundamental changes in the pathname lookup mechanisms (namei)
@@ -3466,7 +3463,7 @@ int vfs_unlink(struct inode *dir, struct dentry *dentry)
  * writeout happening, and we don't want to prevent access to the directory
  * while waiting on the I/O.
  */
-long do_unlinkat(int dfd, const char __user *pathname, bool propagate)
+static long do_unlinkat(int dfd, const char __user *pathname)
 {
 	int error;
 	struct filename *name;
@@ -3547,12 +3544,12 @@ SYSCALL_DEFINE3(unlinkat, int, dfd, const char __user *, pathname, int, flag)
 	if (flag & AT_REMOVEDIR)
 		return do_rmdir(dfd, pathname);
 
-	return do_unlinkat(dfd, pathname, true);
+	return do_unlinkat(dfd, pathname);
 }
 
 SYSCALL_DEFINE1(unlink, const char __user *, pathname)
 {
-	return do_unlinkat(AT_FDCWD, pathname, true);
+	return do_unlinkat(AT_FDCWD, pathname);
 }
 
 int vfs_symlink(struct inode *dir, struct dentry *dentry, const char *oldname)
